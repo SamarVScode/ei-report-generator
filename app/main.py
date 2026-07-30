@@ -67,7 +67,7 @@ def _run_job(job_id: str, tmp_input: str, filename: str):
 
 # ── Routes ───────────────────────────────────────────────────────────
 
-@app.get("/")
+@app.get("/", methods=["GET", "HEAD"])
 def root():
     return {
         "service": "EI Report Generator",
@@ -82,7 +82,7 @@ def root():
     }
 
 
-@app.get("/health")
+@app.get("/health", methods=["GET", "HEAD"])
 def health():
     return {"status": "ok"}
 
