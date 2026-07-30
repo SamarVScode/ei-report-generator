@@ -187,6 +187,17 @@
     // Remove
     removeBtn.addEventListener("click", clearFile);
 
+    async function wakeUp() {
+      // Retry HEAD until service responds (handles spin-up from idle)
+      for (let i = 0; i < 30; i++) {
+        try {
+          const r = await fetch(`${API}/health`, { method: "HEAD" });
+          if (r.ok) return;
+        } catch {}
+        await new Promise(r => setTimeout(r, 3000));
+      }
+    }
+
     // Submit — async job flow
     submitBtn.addEventListener("click", async () => {
       if (!selectedFile) return;
@@ -198,6 +209,10 @@
       form.append("file", selectedFile);
 
       try {
+        // Step 0: Wake up service if idle
+        showStatus("loading", '<span class="spinner"></span>Connecting to service...');
+        await wakeUp();
+
         // Step 1: Submit job
         const submitRes = await fetch(`${API}/generate-report`, { method: "POST", body: form });
 
@@ -233,17 +248,37 @@
     });
 
     async function pollJob(jobId) {
-      const maxAttempts = 120; // 120 × 3s = 6 min max
-      const interval = 3000;
+      const maxAttempts = 200; // 200 × 5s = ~16 min max
+      const interval = 5000;
+      let consecutive502 = 0;
 
       for (let i = 0; i < maxAttempts; i++) {
         await new Promise(r => setTimeout(r, interval));
 
-        const res = await fetch(`${API}/jobs/${jobId}`);
+        let res;
+        try {
+          res = await fetch(`${API}/jobs/${jobId}`);
+        } catch (e) {
+          // Network error — service may be waking up
+          consecutive502++;
+          const elapsed = ((i + 1) * interval / 1000).toFixed(0);
+          showStatus("loading", `<span class="spinner"></span>Waking up service... (${elapsed}s)<div class="progress-bar"><div class="fill"></div></div>`);
+          continue;
+        }
+
+        // 502/503/504 = service waking up from idle, retry silently
+        if (res.status === 502 || res.status === 503 || res.status === 504) {
+          consecutive502++;
+          const elapsed = ((i + 1) * interval / 1000).toFixed(0);
+          showStatus("loading", `<span class="spinner"></span>Waking up service... (${elapsed}s)<div class="progress-bar"><div class="fill"></div></div>`);
+          continue;
+        }
+
+        consecutive502 = 0;
+
         if (!res.ok) throw new Error(`Poll failed: ${res.status}`);
 
         const data = await res.json();
-
         if (data.status === "done" || data.status === "error") return data;
 
         // Update status with elapsed time
