@@ -22,6 +22,7 @@ import shutil
 from datetime import datetime
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 
 from .report_generator import generate_report, ReportError
@@ -30,6 +31,13 @@ app = FastAPI(
     title="EI Report Generator",
     description="Upload an E2E Task XLSX file and receive the processed EI Summary report.",
     version="1.0.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
