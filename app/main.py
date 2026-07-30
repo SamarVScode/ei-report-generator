@@ -19,7 +19,7 @@ from threading import Thread
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response, RedirectResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from .report_generator import generate_report, ReportError
@@ -39,10 +39,15 @@ app.add_middleware(
 
 app.mount("/static", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")), name="static")
 
+# Results directory — persists output files on disk
+RESULTS_DIR = os.path.join(os.path.dirname(__file__), "results")
+os.makedirs(RESULTS_DIR, exist_ok=True)
+
 
 @app.get("/test.html", include_in_schema=False)
 def test_page():
     return RedirectResponse(url="/static/test.html")
+
 
 # ── In-memory job store ──────────────────────────────────────────────
 jobs: dict[str, dict] = {}
@@ -56,13 +61,21 @@ class JobStatus(str, Enum):
 
 
 def _run_job(job_id: str, tmp_input: str, filename: str):
-    """Run report generation in a background thread."""
+    """Run report generation in a background thread. Saves output to disk."""
     try:
         jobs[job_id]["status"] = JobStatus.PROCESSING
         report_bytes = generate_report(tmp_input)
+
+        # Save to disk keyed by job_id
+        output_filename = f"EI_SUMMARY_{datetime.now().strftime('%Y-%m-%d')}.xlsx"
+        output_path = os.path.join(RESULTS_DIR, f"{job_id}.xlsx")
+        with open(output_path, "wb") as f:
+            f.write(report_bytes)
+
         jobs[job_id]["status"] = JobStatus.DONE
-        jobs[job_id]["result"] = report_bytes
-        jobs[job_id]["output_filename"] = f"EI_SUMMARY_{datetime.now().strftime('%Y-%m-%d')}.xlsx"
+        jobs[job_id]["output_path"] = output_path
+        jobs[job_id]["output_filename"] = output_filename
+
     except ReportError as e:
         jobs[job_id]["status"] = JobStatus.ERROR
         jobs[job_id]["error"] = str(e)
@@ -123,9 +136,9 @@ async def submit_job(file: UploadFile = File(...)):
         "status": JobStatus.PENDING,
         "filename": file.filename,
         "created_at": datetime.now().isoformat(),
-        "result": None,
-        "error": None,
+        "output_path": None,
         "output_filename": None,
+        "error": None,
     }
 
     # Start background thread
@@ -164,7 +177,7 @@ def get_job(job_id: str):
 
 @app.get("/jobs/{job_id}/download")
 def download_job(job_id: str):
-    """Download the generated report. Only available when status is 'done'."""
+    """Download the generated report, then delete the file from disk."""
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found.")
 
@@ -176,10 +189,24 @@ def download_job(job_id: str):
             detail=f"Job status is '{job['status']}'. Wait for status 'done'.",
         )
 
-    return Response(
-        content=job["result"],
+    output_path = job["output_path"]
+
+    if not os.path.exists(output_path):
+        raise HTTPException(status_code=404, detail="Report file not found on disk.")
+
+    # Serve the file
+    response = FileResponse(
+        path=output_path,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={
-            "Content-Disposition": f'attachment; filename="{job["output_filename"]}"'
-        },
+        filename=job["output_filename"],
     )
+
+    # Delete after serving — use a background task
+    @response.on_close
+    def cleanup():
+        try:
+            os.remove(output_path)
+        except OSError:
+            pass
+
+    return response
