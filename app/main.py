@@ -19,7 +19,8 @@ from threading import Thread
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import Response, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 
 from .report_generator import generate_report, ReportError
 
@@ -35,6 +36,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.mount("/static", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")), name="static")
+
+
+@app.get("/test.html", include_in_schema=False)
+def test_page():
+    return RedirectResponse(url="/static/test.html")
 
 # ── In-memory job store ──────────────────────────────────────────────
 jobs: dict[str, dict] = {}
