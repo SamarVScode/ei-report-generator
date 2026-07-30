@@ -252,7 +252,13 @@
 
       try {
         const start = Date.now();
-        const res = await fetch(API, { method: "POST", body: form });
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 300000); // 5 min timeout
+
+        showStatus("loading", '<span class="spinner"></span>Uploading file... Server may take 30-60s to wake up if idle.');
+
+        const res = await fetch(API, { method: "POST", body: form, signal: controller.signal });
+        clearTimeout(timeoutId);
 
         if (!res.ok) {
           let detail = "Unknown error";
@@ -275,7 +281,10 @@
 
         showStatus("success", `Report generated in ${elapsed}s — download started.`);
       } catch (err) {
-        showStatus("error", `Network error: ${err.message}`);
+        const msg = err.name === "AbortError"
+          ? "Request timed out after 5 minutes. Server might be overloaded."
+          : `Network error: ${err.message}. Make sure server is awake — open /health first.`;
+        showStatus("error", msg);
       }
 
       submitBtn.disabled = false;
