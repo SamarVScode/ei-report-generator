@@ -1,27 +1,21 @@
 """
 EI Report Server
 =================
-FastAPI server that accepts XLSX files and returns processed EI Summary reports.
+FastAPI server with async job system for EI Report generation.
 
-Run:
-    uvicorn app.main:app --host 0.0.0.0 --port 8000
-
-Test:
-    curl -X POST http://localhost:8000/generate-report \
-      -F "file=@E2E Task - WK 31.xlsx" \
-      -o EI_SUMMARY.xlsx
-
-Docs:
-    http://localhost:8000/docs
+Flow:
+    POST /generate-report  → returns { job_id } immediately
+    GET  /jobs/{job_id}    → poll status (pending / processing / done / error)
+    GET  /jobs/{job_id}/download → download result when done
 """
 
 import os
-import sys
+import uuid
 import tempfile
 import shutil
 from datetime import datetime
-
-import uvicorn
+from enum import Enum
+from threading import Thread
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -31,8 +25,8 @@ from .report_generator import generate_report, ReportError
 
 app = FastAPI(
     title="EI Report Generator",
-    description="Upload an E2E Task XLSX file and receive the processed EI Summary report.",
-    version="1.0.0",
+    description="Async job-based EI Report generation API.",
+    version="2.0.0",
 )
 
 app.add_middleware(
@@ -42,14 +36,47 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── In-memory job store ──────────────────────────────────────────────
+jobs: dict[str, dict] = {}
+
+
+class JobStatus(str, Enum):
+    PENDING = "pending"
+    PROCESSING = "processing"
+    DONE = "done"
+    ERROR = "error"
+
+
+def _run_job(job_id: str, tmp_input: str, filename: str):
+    """Run report generation in a background thread."""
+    try:
+        jobs[job_id]["status"] = JobStatus.PROCESSING
+        report_bytes = generate_report(tmp_input)
+        jobs[job_id]["status"] = JobStatus.DONE
+        jobs[job_id]["result"] = report_bytes
+        jobs[job_id]["output_filename"] = f"EI_SUMMARY_{datetime.now().strftime('%Y-%m-%d')}.xlsx"
+    except ReportError as e:
+        jobs[job_id]["status"] = JobStatus.ERROR
+        jobs[job_id]["error"] = str(e)
+    except Exception as e:
+        jobs[job_id]["status"] = JobStatus.ERROR
+        jobs[job_id]["error"] = f"Report generation failed: {e}"
+    finally:
+        shutil.rmtree(os.path.dirname(tmp_input), ignore_errors=True)
+
+
+# ── Routes ───────────────────────────────────────────────────────────
 
 @app.get("/")
 def root():
     return {
         "service": "EI Report Generator",
+        "version": "2.0.0",
         "status": "running",
         "endpoints": {
-            "POST /generate-report": "Upload XLSX, receive EI Summary",
+            "POST /generate-report": "Upload XLSX → returns job_id",
+            "GET /jobs/{job_id}": "Check job status",
+            "GET /jobs/{job_id}/download": "Download result",
             "GET /docs": "Swagger UI",
         },
     }
@@ -61,53 +88,90 @@ def health():
 
 
 @app.post("/generate-report")
-async def generate_report_endpoint(file: UploadFile = File(...)):
+async def submit_job(file: UploadFile = File(...)):
     """
-    Accept an E2E Task XLSX file and return the generated EI Summary report.
+    Upload an E2E Task XLSX file.
 
-    The uploaded file must contain:
-    - `Task_per_1k` sheet (required)
-    - `Raw` sheet (optional, generates additional tabs if present)
-
-    Returns the EI_SUMMARY_<date>.xlsx as a downloadable file.
+    Returns a `job_id` immediately. Poll `/jobs/{job_id}` for status.
     """
     if not file.filename:
         raise HTTPException(status_code=400, detail="No filename provided.")
 
-    # Validate file extension
-    if not file.filename.lower().endswith('.xlsx'):
+    if not file.filename.lower().endswith(".xlsx"):
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid file type: {file.filename}. Expected .xlsx file."
+            detail=f"Invalid file type: {file.filename}. Expected .xlsx file.",
         )
 
-    # Save uploaded file to temp location
+    # Save upload to temp
     tmp_dir = tempfile.mkdtemp()
     tmp_input = os.path.join(tmp_dir, file.filename)
+    with open(tmp_input, "wb") as f:
+        shutil.copyfileobj(file.file, f)
 
-    try:
-        with open(tmp_input, "wb") as f:
-            shutil.copyfileobj(file.file, f)
+    # Create job
+    job_id = uuid.uuid4().hex[:12]
+    jobs[job_id] = {
+        "status": JobStatus.PENDING,
+        "filename": file.filename,
+        "created_at": datetime.now().isoformat(),
+        "result": None,
+        "error": None,
+        "output_filename": None,
+    }
 
-        # Generate the report
-        report_bytes = generate_report(tmp_input)
+    # Start background thread
+    thread = Thread(target=_run_job, args=(job_id, tmp_input, file.filename), daemon=True)
+    thread.start()
 
-        # Build output filename
-        today_str = datetime.now().strftime("%Y-%m-%d")
-        output_filename = f"EI_SUMMARY_{today_str}.xlsx"
+    return {
+        "job_id": job_id,
+        "status": JobStatus.PENDING,
+        "message": "Job queued. Poll GET /jobs/{job_id} for status.",
+    }
 
-        return Response(
-            content=report_bytes,
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={
-                "Content-Disposition": f'attachment; filename="{output_filename}"'
-            },
+
+@app.get("/jobs/{job_id}")
+def get_job(job_id: str):
+    """Check job status."""
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found.")
+
+    job = jobs[job_id]
+    resp = {
+        "job_id": job_id,
+        "status": job["status"],
+        "filename": job["filename"],
+        "created_at": job["created_at"],
+    }
+
+    if job["status"] == JobStatus.DONE:
+        resp["download_url"] = f"/jobs/{job_id}/download"
+        resp["output_filename"] = job["output_filename"]
+    elif job["status"] == JobStatus.ERROR:
+        resp["error"] = job["error"]
+
+    return resp
+
+
+@app.get("/jobs/{job_id}/download")
+def download_job(job_id: str):
+    """Download the generated report. Only available when status is 'done'."""
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found.")
+
+    job = jobs[job_id]
+
+    if job["status"] != JobStatus.DONE:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Job status is '{job['status']}'. Wait for status 'done'.",
         )
 
-    except ReportError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Report generation failed: {e}")
-    finally:
-        # Cleanup temp files
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+    return Response(
+        content=job["result"],
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": f'attachment; filename="{job["output_filename"]}"'
+        },
+    )

@@ -1,6 +1,16 @@
 # EI Report Generator API
 
-FastAPI server that accepts E2E Task XLSX files and returns processed **EI Summary** reports — the same output as the standalone `ei_report_generator.py`, served over HTTP.
+FastAPI server with **async job system** for EI Report generation. Upload an E2E Task XLSX, get a job ID instantly, poll for completion, then download the result.
+
+---
+
+## How It Works
+
+```
+POST /generate-report  →  { "job_id": "a1b2c3d4e5f6" }   (instant)
+GET  /jobs/{job_id}    →  { "status": "processing" }       (poll every 3s)
+GET  /jobs/{job_id}/download  →  EI_SUMMARY.xlsx           (when done)
+```
 
 ---
 
@@ -12,19 +22,22 @@ FastAPI server that accepts E2E Task XLSX files and returns processed **EI Summa
 https://ei-report-generator.onrender.com
 ```
 
-### Endpoints
+---
 
 #### `GET /`
 
-Service info and available endpoints.
+Service info.
 
-**Response** `200 OK`
+**Response**
 ```json
 {
   "service": "EI Report Generator",
+  "version": "2.0.0",
   "status": "running",
   "endpoints": {
-    "POST /generate-report": "Upload XLSX, receive EI Summary",
+    "POST /generate-report": "Upload XLSX → returns job_id",
+    "GET /jobs/{job_id}": "Check job status",
+    "GET /jobs/{job_id}/download": "Download result",
     "GET /docs": "Swagger UI"
   }
 }
@@ -36,7 +49,7 @@ Service info and available endpoints.
 
 Health check.
 
-**Response** `200 OK`
+**Response**
 ```json
 { "status": "ok" }
 ```
@@ -45,7 +58,7 @@ Health check.
 
 #### `POST /generate-report`
 
-Upload an E2E Task XLSX file and receive the processed EI Summary report.
+Upload an E2E Task XLSX file. Returns a `job_id` immediately (processing happens in background).
 
 **Request**
 
@@ -54,11 +67,75 @@ Upload an E2E Task XLSX file and receive the processed EI Summary report.
 | `file` | `multipart/form-data` | Yes | E2E Task XLSX file (`.xlsx`) |
 
 **Response** `200 OK`
+```json
+{
+  "job_id": "a1b2c3d4e5f6",
+  "status": "pending",
+  "message": "Job queued. Poll GET /jobs/{job_id} for status."
+}
+```
 
+**Errors**
+
+| Status | Cause |
+|--------|-------|
+| `400` | Missing file or wrong file type |
+| `422` | No file field in request |
+
+---
+
+#### `GET /jobs/{job_id}`
+
+Check job status. Poll every **3 seconds**.
+
+**Response** `200 OK`
+
+While processing:
+```json
+{
+  "job_id": "a1b2c3d4e5f6",
+  "status": "processing",
+  "filename": "E2E Task - WK 31.xlsx",
+  "created_at": "2026-07-30T14:30:00"
+}
+```
+
+When done:
+```json
+{
+  "job_id": "a1b2c3d4e5f6",
+  "status": "done",
+  "filename": "E2E Task - WK 31.xlsx",
+  "created_at": "2026-07-30T14:30:00",
+  "download_url": "/jobs/a1b2c3d4e5f6/download",
+  "output_filename": "EI_SUMMARY_2026-07-30.xlsx"
+}
+```
+
+On failure:
+```json
+{
+  "job_id": "a1b2c3d4e5f6",
+  "status": "error",
+  "error": "Missing required sheet: Task_per_1k"
+}
+```
+
+**Status values:** `pending` → `processing` → `done` | `error`
+
+---
+
+#### `GET /jobs/{job_id}/download`
+
+Download the generated report. Only available when `status` is `done`.
+
+**Response** `200 OK`
 - Content-Type: `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`
 - Content-Disposition: `attachment; filename="EI_SUMMARY_YYYY-MM-DD.xlsx"`
 
-**Output Tabs:**
+---
+
+#### Output Tabs
 
 | Tab | Description |
 |-----|-------------|
@@ -68,63 +145,9 @@ Upload an E2E Task XLSX file and receive the processed EI Summary report.
 | `REVERSE EI` | Reverse escalations (MYSR tracking) |
 | `Agent Summary` | Agent counts, counselled (>2), warned (>5) |
 
-**Error Responses**
-
-| Status | Cause |
-|--------|-------|
-| `400` | Missing file, wrong file type, or missing required sheets |
-| `422` | No file field in request |
-| `500` | Internal processing error |
-
-**Example — cURL**
-```bash
-curl -X POST https://ei-report-generator.onrender.com/generate-report \
-  -F "file=@E2E Task - WK 31.xlsx" \
-  -o EI_SUMMARY.xlsx
-```
-
-**Example — Python**
-```python
-import requests
-
-url = "https://ei-report-generator.onrender.com/generate-report"
-
-with open("E2E Task - WK 31.xlsx", "rb") as f:
-    response = requests.post(url, files={"file": f})
-
-if response.status_code == 200:
-    with open("EI_SUMMARY.xlsx", "wb") as out:
-        out.write(response.content)
-    print("Report generated!")
-else:
-    print(f"Error: {response.status_code} — {response.json()}")
-```
-
-**Example — JavaScript (fetch)**
-```javascript
-const formData = new FormData();
-formData.append("file", fileInput.files[0]);
-
-const response = await fetch("https://ei-report-generator.onrender.com/generate-report", {
-  method: "POST",
-  body: formData,
-});
-
-if (response.ok) {
-  const blob = await response.blob();
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = "EI_SUMMARY.xlsx";
-  a.click();
-}
-```
-
 ---
 
 ### Swagger UI
-
-Interactive API docs available at:
 
 ```
 https://ei-report-generator.onrender.com/docs
@@ -132,14 +155,104 @@ https://ei-report-generator.onrender.com/docs
 
 ---
 
-## Input File Requirements
+## Usage Examples
 
-The uploaded XLSX must contain:
+### Python
+
+```python
+import requests, time
+
+API = "https://ei-report-generator.onrender.com"
+
+# 1. Upload
+with open("E2E Task - WK 31.xlsx", "rb") as f:
+    res = requests.post(f"{API}/generate-report", files={"file": f})
+
+job = res.json()
+job_id = job["job_id"]
+print(f"Job created: {job_id}")
+
+# 2. Poll
+while True:
+    res = requests.get(f"{API}/jobs/{job_id}")
+    data = res.json()
+    print(f"Status: {data['status']}")
+
+    if data["status"] == "done":
+        break
+    if data["status"] == "error":
+        print(f"Error: {data['error']}")
+        exit(1)
+
+    time.sleep(3)
+
+# 3. Download
+res = requests.get(f"{API}/jobs/{job_id}/download")
+with open(data["output_filename"], "wb") as f:
+    f.write(res.content)
+print(f"Saved: {data['output_filename']}")
+```
+
+### cURL
+
+```bash
+# 1. Upload
+JOB_ID=$(curl -s -X POST https://ei-report-generator.onrender.com/generate-report \
+  -F "file=@E2E Task - WK 31.xlsx" | python -c "import sys,json;print(json.load(sys.stdin)['job_id'])")
+
+echo "Job: $JOB_ID"
+
+# 2. Poll
+while true; do
+  STATUS=$(curl -s https://ei-report-generator.onrender.com/jobs/$JOB_ID | python -c "import sys,json;print(json.load(sys.stdin)['status'])")
+  echo "Status: $STATUS"
+  [ "$STATUS" = "done" ] && break
+  [ "$STATUS" = "error" ] && exit 1
+  sleep 3
+done
+
+# 3. Download
+curl -o EI_SUMMARY.xlsx https://ei-report-generator.onrender.com/jobs/$JOB_ID/download
+```
+
+### JavaScript (Browser)
+
+```javascript
+const API = "https://ei-report-generator.onrender.com";
+
+async function generateReport(file) {
+  // 1. Upload
+  const form = new FormData();
+  form.append("file", file);
+  const { job_id } = await fetch(`${API}/generate-report`, { method: "POST", body: form })
+    .then(r => r.json());
+
+  // 2. Poll
+  while (true) {
+    const job = await fetch(`${API}/jobs/${job_id}`).then(r => r.json());
+    if (job.status === "done") return job;
+    if (job.status === "error") throw new Error(job.error);
+    await new Promise(r => setTimeout(r, 3000));
+  }
+}
+
+// 3. Download
+const job = await generateReport(fileInput.files[0]);
+const blob = await fetch(`${API}/jobs/${job.job_id}/download`).then(r => r.blob());
+const a = document.createElement("a");
+a.href = URL.createObjectURL(blob);
+a.download = job.output_filename;
+a.click();
+```
+
+---
+
+## Input File Requirements
 
 | Sheet | Required | Description |
 |-------|----------|-------------|
 | `Task_per_1k` | **Yes** | Metrics by DC/region/city with date/WTD blocks |
-| `Raw` | No | Escalation records (if present, generates extra tabs) |
+| `Raw` | No | Escalation records (generates extra tabs if present) |
 
 Allowed Source DCs: `JNP`, `MAU`, `ALG`, `SPR`, `MTH`, `MZN`, `JHS`, `AYP`, `DEO`, `MRZ`, `RBR`
 
@@ -148,56 +261,25 @@ Allowed Source DCs: `JNP`, `MAU`, `ALG`, `SPR`, `MTH`, `MZN`, `JHS`, `AYP`, `DEO
 ## Local Development
 
 ```bash
-# Clone
 git clone https://github.com/SamarVScode/ei-report-generator.git
 cd ei-report-generator
-
-# Install
 pip install -r requirements.txt
-
-# Run
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-
-# Open docs
-open http://localhost:8000/docs
+# Open http://localhost:8000/docs
 ```
 
 ---
 
 ## Deploy to Render.io
 
-### Option A — Auto Deploy (render.yaml)
+1. Go to [render.com/dashboard](https://dashboard.render.com)
+2. **New +** → **Web Service**
+3. Connect GitHub repo: `SamarVScode/ei-report-generator`
+4. Render auto-detects `render.yaml` — confirm settings
+5. Click **Create Web Service**
+6. Live at `https://ei-report-generator.onrender.com`
 
-1. Push this repo to GitHub
-2. Go to [render.com/dashboard](https://dashboard.render.com)
-3. **New +** → **Web Service**
-4. Connect your GitHub repo: `SamarVScode/ei-report-generator`
-5. Render auto-detects `render.yaml` — confirm settings:
-   - **Runtime:** Python
-   - **Build:** `pip install -r requirements.txt`
-   - **Start:** `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
-   - **Plan:** Free
-6. Click **Create Web Service**
-7. Wait for deploy (~2-3 min)
-8. Your API is live at `https://ei-report-generator.onrender.com`
-
-### Option B — Manual (Dockerfile)
-
-1. Push this repo to GitHub
-2. Go to [render.com/dashboard](https://dashboard.render.com)
-3. **New +** → **Web Service**
-4. Connect repo: `SamarVScode/ei-report-generator`
-5. Settings:
-   - **Runtime:** Docker
-   - **Dockerfile:** `./Dockerfile`
-   - **Plan:** Free
-6. Click **Create Web Service**
-
-### Post-Deploy
-
-- Swagger UI: `https://your-app.onrender.com/docs`
-- Health check: `https://your-app.onrender.com/health`
-- Free tier spins down after 15 min idle — first request after idle takes ~30-60s to wake up
+Free tier: spins down after 15 min idle. First request takes ~30-60s to wake.
 
 ---
 
@@ -207,11 +289,12 @@ open http://localhost:8000/docs
 ei-report-generator/
 ├── app/
 │   ├── __init__.py
-│   ├── main.py              # FastAPI server
+│   ├── main.py              # FastAPI server (async job system)
 │   └── report_generator.py  # Core report logic
-├── Dockerfile               # Container deployment
-├── render.yaml              # Render auto-config
-├── requirements.txt         # Python dependencies
+├── Dockerfile
+├── render.yaml
+├── requirements.txt
+├── test.html                # Browser test page
 ├── .gitignore
 └── README.md
 ```
