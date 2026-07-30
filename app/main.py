@@ -10,6 +10,7 @@ Flow:
 """
 
 import os
+import json
 import uuid
 import tempfile
 import shutil
@@ -39,9 +40,11 @@ app.add_middleware(
 
 app.mount("/static", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")), name="static")
 
-# Results directory — persists output files on disk
+# Directories
 RESULTS_DIR = os.path.join(os.path.dirname(__file__), "results")
+JOBS_DIR = os.path.join(os.path.dirname(__file__), "jobs")
 os.makedirs(RESULTS_DIR, exist_ok=True)
+os.makedirs(JOBS_DIR, exist_ok=True)
 
 
 @app.get("/test.html", include_in_schema=False)
@@ -49,8 +52,23 @@ def test_page():
     return RedirectResponse(url="/static/test.html")
 
 
-# ── In-memory job store ──────────────────────────────────────────────
-jobs: dict[str, dict] = {}
+# ── File-based job store (survives restarts) ─────────────────────────
+
+def _job_path(job_id: str) -> str:
+    return os.path.join(JOBS_DIR, f"{job_id}.json")
+
+
+def _save_job(job_id: str, data: dict):
+    with open(_job_path(job_id), "w") as f:
+        json.dump(data, f)
+
+
+def _load_job(job_id: str) -> dict | None:
+    path = _job_path(job_id)
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        return json.load(f)
 
 
 class JobStatus(str, Enum):
@@ -63,25 +81,33 @@ class JobStatus(str, Enum):
 def _run_job(job_id: str, tmp_input: str, filename: str):
     """Run report generation in a background thread. Saves output to disk."""
     try:
-        jobs[job_id]["status"] = JobStatus.PROCESSING
+        job = _load_job(job_id)
+        job["status"] = JobStatus.PROCESSING
+        _save_job(job_id, job)
+
         report_bytes = generate_report(tmp_input)
 
-        # Save to disk keyed by job_id
+        # Save output to disk
         output_filename = f"EI_SUMMARY_{datetime.now().strftime('%Y-%m-%d')}.xlsx"
         output_path = os.path.join(RESULTS_DIR, f"{job_id}.xlsx")
         with open(output_path, "wb") as f:
             f.write(report_bytes)
 
-        jobs[job_id]["status"] = JobStatus.DONE
-        jobs[job_id]["output_path"] = output_path
-        jobs[job_id]["output_filename"] = output_filename
+        job["status"] = JobStatus.DONE
+        job["output_path"] = output_path
+        job["output_filename"] = output_filename
+        _save_job(job_id, job)
 
     except ReportError as e:
-        jobs[job_id]["status"] = JobStatus.ERROR
-        jobs[job_id]["error"] = str(e)
+        job = _load_job(job_id)
+        job["status"] = JobStatus.ERROR
+        job["error"] = str(e)
+        _save_job(job_id, job)
     except Exception as e:
-        jobs[job_id]["status"] = JobStatus.ERROR
-        jobs[job_id]["error"] = f"Report generation failed: {e}"
+        job = _load_job(job_id)
+        job["status"] = JobStatus.ERROR
+        job["error"] = f"Report generation failed: {e}"
+        _save_job(job_id, job)
     finally:
         shutil.rmtree(os.path.dirname(tmp_input), ignore_errors=True)
 
@@ -132,7 +158,7 @@ async def submit_job(file: UploadFile = File(...)):
 
     # Create job
     job_id = uuid.uuid4().hex[:12]
-    jobs[job_id] = {
+    job_data = {
         "status": JobStatus.PENDING,
         "filename": file.filename,
         "created_at": datetime.now().isoformat(),
@@ -140,6 +166,7 @@ async def submit_job(file: UploadFile = File(...)):
         "output_filename": None,
         "error": None,
     }
+    _save_job(job_id, job_data)
 
     # Start background thread
     thread = Thread(target=_run_job, args=(job_id, tmp_input, file.filename), daemon=True)
@@ -155,10 +182,10 @@ async def submit_job(file: UploadFile = File(...)):
 @app.get("/jobs/{job_id}")
 def get_job(job_id: str):
     """Check job status."""
-    if job_id not in jobs:
+    job = _load_job(job_id)
+    if job is None:
         raise HTTPException(status_code=404, detail="Job not found.")
 
-    job = jobs[job_id]
     resp = {
         "job_id": job_id,
         "status": job["status"],
@@ -178,10 +205,9 @@ def get_job(job_id: str):
 @app.get("/jobs/{job_id}/download")
 def download_job(job_id: str):
     """Download the generated report, then delete the file from disk."""
-    if job_id not in jobs:
+    job = _load_job(job_id)
+    if job is None:
         raise HTTPException(status_code=404, detail="Job not found.")
-
-    job = jobs[job_id]
 
     if job["status"] != JobStatus.DONE:
         raise HTTPException(
@@ -201,7 +227,7 @@ def download_job(job_id: str):
         filename=job["output_filename"],
     )
 
-    # Delete after serving — use a background task
+    # Delete after serving
     @response.on_close
     def cleanup():
         try:
