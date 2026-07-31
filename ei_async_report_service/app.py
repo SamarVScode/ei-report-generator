@@ -1,0 +1,60 @@
+from pathlib import Path
+from typing import Optional
+from fastapi import FastAPI, HTTPException, Header, Query, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, FileResponse
+from ui import get_test_bench_html
+from config import CACHE_DIR
+from auth import verify_api_key
+from jobs import active_jobs, create_report_job
+
+def create_app() -> FastAPI:
+    app = FastAPI(title="Async EI Report Server")
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    @app.get("/")
+    async def root():
+        return {"status": "ready", "message": "Async EI Report Server running. Visit /test for UI."}
+
+    @app.get("/health")
+    async def health():
+        return {"status": "ok", "cache_dir": str(CACHE_DIR), "active_jobs": len(active_jobs)}
+
+    @app.get("/test", response_class=HTMLResponse)
+    async def test_page():
+        return get_test_bench_html()
+
+    @app.get("/convert-async")
+    async def convert_async(
+        drive_url: str = Query(..., description="Google Drive URL"),
+        x_api_key: Optional[str] = Depends(verify_api_key)
+    ):
+        return create_report_job(drive_url)
+
+    @app.get("/job/{job_id}")
+    async def job_status(job_id: str):
+        job = active_jobs.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        return {"job_id": job_id, "status": job["status"], "progress": job["progress"], "error": job["error"]}
+
+    @app.get("/job/{job_id}/result")
+    async def job_result(job_id: str):
+        job = active_jobs.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        if job["status"] != "done":
+            raise HTTPException(status_code=400, detail=f"Job not ready. Status: {job['status']}")
+        output_path = Path(job["output_path"])
+        if not output_path.exists():
+            raise HTTPException(status_code=410, detail="Result file expired")
+        return FileResponse(output_path, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", filename=f"EI_SUMMARY_{job_id}.xlsx")
+
+    return app
