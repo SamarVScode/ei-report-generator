@@ -9,7 +9,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from ui import get_test_bench_html
 from config import CACHE_DIR
 from auth import verify_api_key
-from jobs import active_jobs, create_report_job, create_upload_report_job, _load_job
+from jobs import active_jobs, create_report_job, create_upload_report_job, recover_jobs_from_disk
 
 log = logging.getLogger("ei_server.app")
 
@@ -24,7 +24,15 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="Async EI Report Server")
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def lifespan(app):
+        # Startup: recover completed jobs from ephemeral disk (handles Render dyno recycles)
+        recover_jobs_from_disk()
+        yield
+
+    app = FastAPI(title="Async EI Report Server", lifespan=lifespan)
 
     app.add_middleware(RequestLoggingMiddleware)
     app.add_middleware(
@@ -68,7 +76,7 @@ def create_app() -> FastAPI:
     @app.get("/job/{job_id}")
     @app.get("/jobs/{job_id}")
     async def job_status(job_id: str):
-        job = _load_job(job_id)
+        job = active_jobs.get(job_id)
         if not job:
             raise HTTPException(status_code=404, detail="Job not found")
         return {"job_id": job_id, "status": job["status"], "progress": job["progress"], "error": job["error"]}
@@ -76,7 +84,7 @@ def create_app() -> FastAPI:
     @app.get("/job/{job_id}/result")
     @app.get("/jobs/{job_id}/download")
     async def job_result(job_id: str):
-        job = _load_job(job_id)
+        job = active_jobs.get(job_id)
         if not job:
             raise HTTPException(status_code=404, detail="Job not found")
         if job["status"] != "done":
