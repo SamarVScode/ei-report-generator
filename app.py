@@ -1,12 +1,12 @@
 from pathlib import Path
 from typing import Optional
-from fastapi import FastAPI, HTTPException, Header, Query, Depends
+from fastapi import FastAPI, HTTPException, Header, Query, Depends, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, FileResponse
 from ui import get_test_bench_html
 from config import CACHE_DIR
 from auth import verify_api_key
-from jobs import active_jobs, create_report_job
+from jobs import active_jobs, create_report_job, create_upload_report_job
 
 def create_app() -> FastAPI:
     app = FastAPI(title="Async EI Report Server")
@@ -37,6 +37,15 @@ def create_app() -> FastAPI:
         x_api_key: Optional[str] = Depends(verify_api_key)
     ):
         return create_report_job(drive_url)
+
+    @app.post("/convert-upload")
+    async def convert_upload(
+        file: UploadFile = File(...),
+        x_api_key: Optional[str] = Depends(verify_api_key)
+    ):
+        content = await file.read()
+        return create_upload_report_job(content, file.filename or "upload.xlsx")
+
 
     @app.get("/job/{job_id}")
     async def job_status(job_id: str):

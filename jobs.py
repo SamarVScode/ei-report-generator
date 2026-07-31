@@ -84,3 +84,30 @@ def create_report_job(drive_url: str) -> Dict[str, str]:
     thread.start()
 
     return {"job_id": job_id, "status": "processing"}
+
+def create_upload_report_job(file_bytes: bytes, filename: str = "upload.xlsx") -> Dict[str, str]:
+    evict_old_jobs()
+    job_id = str(uuid.uuid4())[:8]
+    file_id = f"upload_{job_id}"
+    tmp_xlsx = CACHE_DIR / f"{file_id}.xlsx"
+    with open(tmp_xlsx, "wb") as f:
+        f.write(file_bytes)
+
+    output_path = CACHE_DIR / f"EI_SUMMARY_{job_id}.xlsx"
+    active_jobs[job_id] = {
+        "status": "processing",
+        "output_path": str(output_path),
+        "error": None,
+        "progress": "Uploaded, starting generation...",
+        "created_at": time.time()
+    }
+
+    thread = threading.Thread(
+        target=background_report_job,
+        args=(job_id, file_id, output_path),
+        daemon=True
+    )
+    thread.start()
+
+    return {"job_id": job_id, "status": "processing"}
+
