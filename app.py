@@ -39,6 +39,7 @@ def create_app() -> FastAPI:
         return create_report_job(drive_url)
 
     @app.post("/convert-upload")
+    @app.post("/generate-report")
     async def convert_upload(
         file: UploadFile = File(...),
         x_api_key: Optional[str] = Depends(verify_api_key)
@@ -48,6 +49,7 @@ def create_app() -> FastAPI:
 
 
     @app.get("/job/{job_id}")
+    @app.get("/jobs/{job_id}")
     async def job_status(job_id: str):
         job = active_jobs.get(job_id)
         if not job:
@@ -55,6 +57,7 @@ def create_app() -> FastAPI:
         return {"job_id": job_id, "status": job["status"], "progress": job["progress"], "error": job["error"]}
 
     @app.get("/job/{job_id}/result")
+    @app.get("/jobs/{job_id}/download")
     async def job_result(job_id: str):
         job = active_jobs.get(job_id)
         if not job:
