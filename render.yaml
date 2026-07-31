@@ -1,10 +1,13 @@
 services:
   - type: web
-    name: ei-report-server
-    runtime: python
-    plan: free
+    name: ei-async-report-service
+    env: python
+    region: singapore
+    plan: starter
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     envVars:
+      - key: API_KEY
+        generateValue: true
       - key: PYTHON_VERSION
-        value: "3.12"
+        value: 3.9.0
