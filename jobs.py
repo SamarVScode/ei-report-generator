@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 from typing import Dict, Any, Optional
 from fastapi import HTTPException
-from config import CACHE_DIR, CACHE_TTL
+from config import CACHE_DIR, CACHE_TTL, CACHE_MAX_AGE
 from downloader import extract_file_id, download_drive_file
 from generator import generate_ei_report
 
@@ -41,18 +41,25 @@ def _load_job(job_id: str) -> Optional[Dict[str, Any]]:
             log.warning(f"Could not load job {job_id} from disk: {e}")
     return None
 
-def evict_old_jobs(max_age_seconds: int = 7200) -> None:
+def evict_old_jobs(max_age_seconds: int = CACHE_MAX_AGE) -> None:
     now = time.time()
     to_delete = []
     for jid, job in list(active_jobs.items()):
+        status = job.get("status", "processing")
         created = job.get("created_at", now)
+        if status == "processing":
+            continue  # never evict running jobs
         if now - created > max_age_seconds:
             to_delete.append(jid)
     for jid in to_delete:
         del active_jobs[jid]
         _job_file_path(jid).unlink(missing_ok=True)
+        log.info(f"Evicted old job {jid}")
+    if to_delete:
+        log.info(f"Evicted {len(to_delete)} old job(s)")
 
 def background_report_job(job_id: str, file_id: str, output_path: Path) -> None:
+    log.info(f"Job {job_id} starting (file_id={file_id})")
     acquired = conversion_semaphore.acquire(timeout=1800)
     job = _load_job(job_id) or {"status": "processing", "output_path": str(output_path), "created_at": time.time()}
 
@@ -61,6 +68,7 @@ def background_report_job(job_id: str, file_id: str, output_path: Path) -> None:
         job["error"] = "Server busy: concurrent limit reached."
         job["progress"] = "Failed: server busy"
         _save_job(job_id, job)
+        log.error(f"Job {job_id} failed: server busy (semaphore timeout)")
         return
 
     try:
@@ -70,21 +78,27 @@ def background_report_job(job_id: str, file_id: str, output_path: Path) -> None:
         tmp_xlsx = CACHE_DIR / f"{file_id}.xlsx"
         if not file_id.startswith("upload_"):
             if not tmp_xlsx.exists() or (time.time() - tmp_xlsx.stat().st_mtime > CACHE_TTL):
+                log.info(f"Job {job_id}: downloading Drive file {file_id}")
                 download_drive_file(file_id, tmp_xlsx)
+            else:
+                log.info(f"Job {job_id}: using cached file {tmp_xlsx}")
 
         job["progress"] = "Generating EI Report..."
         _save_job(job_id, job)
 
+        log.info(f"Job {job_id}: generating report")
         generate_ei_report(str(tmp_xlsx), str(output_path))
 
         job["status"] = "done"
         job["progress"] = "Complete"
         _save_job(job_id, job)
+        log.info(f"Job {job_id}: done")
     except Exception as e:
         job["status"] = "error"
         job["error"] = str(e)
         job["progress"] = f"Failed: {str(e)}"
         _save_job(job_id, job)
+        log.error(f"Job {job_id} failed: {e}", exc_info=True)
     finally:
         conversion_semaphore.release()
 
@@ -92,6 +106,7 @@ def create_report_job(drive_url: str) -> Dict[str, str]:
     evict_old_jobs()
     file_id = extract_file_id(drive_url)
     job_id = str(uuid.uuid4())[:8]
+    log.info(f"Creating report job {job_id} for file_id={file_id}")
 
     cache_key = hashlib.md5(f"{file_id}_report".encode()).hexdigest()
     output_path = CACHE_DIR / f"EI_SUMMARY_{cache_key}.xlsx"
@@ -105,6 +120,7 @@ def create_report_job(drive_url: str) -> Dict[str, str]:
             "created_at": time.time()
         }
         _save_job(job_id, job_data)
+        log.info(f"Job {job_id}: returning cached result")
         return {"job_id": job_id, "status": "done"}
 
     job_data = {
@@ -129,6 +145,7 @@ def create_upload_report_job(file_bytes: bytes, filename: str = "upload.xlsx") -
     evict_old_jobs()
     job_id = str(uuid.uuid4())[:8]
     file_id = f"upload_{job_id}"
+    log.info(f"Creating upload report job {job_id} (filename={filename}, size={len(file_bytes)} bytes)")
     tmp_xlsx = CACHE_DIR / f"{file_id}.xlsx"
     with open(tmp_xlsx, "wb") as f:
         f.write(file_bytes)

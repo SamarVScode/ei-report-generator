@@ -1,10 +1,13 @@
 import sys
 import os
+import logging
 from datetime import datetime, timedelta
 import openpyxl
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.formatting.rule import CellIsRule
 from openpyxl.utils import get_column_letter
+
+log = logging.getLogger("ei_server.generator")
 
 ALLOWED_SOURCE_DC = [
     'JNP', 'MAU', 'ALG', 'SPR', 'MTH',
@@ -327,9 +330,8 @@ def write_filtered_dc_tab(wb, headers, filt_rows):
         cell.font       = Font(bold=True)
         cell.fill       = PatternFill("solid", fgColor="F1F5F9")
         cell.alignment  = _center()
-    for r_idx, row in enumerate(filt_rows, start=2):
-        for c_idx, val in enumerate(row, start=1):
-            ws.cell(row=r_idx, column=c_idx, value=val)
+    for row in filt_rows:
+        ws.append(row)
     for c in range(1, len(headers) + 1):
         ws.column_dimensions[get_column_letter(c)].width = 18
 
@@ -345,9 +347,8 @@ def write_fwd_ei_tab(wb, headers, filt_rows, track_idx):
         cell.font      = Font(bold=True)
         cell.fill      = PatternFill("solid", fgColor="F1F5F9")
         cell.alignment = _center()
-    for r_idx, row in enumerate(fwd_rows, start=2):
-        for c_idx, val in enumerate(row, start=1):
-            ws.cell(row=r_idx, column=c_idx, value=val)
+    for row in fwd_rows:
+        ws.append(row)
     for c in range(1, len(headers) + 1):
         ws.column_dimensions[get_column_letter(c)].width = 18
 
@@ -363,9 +364,8 @@ def write_rev_ei_tab(wb, headers, filt_rows, track_idx):
         cell.font      = Font(bold=True)
         cell.fill      = PatternFill("solid", fgColor="F1F5F9")
         cell.alignment = _center()
-    for r_idx, row in enumerate(rev_rows, start=2):
-        for c_idx, val in enumerate(row, start=1):
-            ws.cell(row=r_idx, column=c_idx, value=val)
+    for row in rev_rows:
+        ws.append(row)
     for c in range(1, len(headers) + 1):
         ws.column_dimensions[get_column_letter(c)].width = 18
 
@@ -465,31 +465,46 @@ def write_agent_summary_tab(wb, filt_rows, track_idx, fwd_agt_idx, rev_agt_idx, 
         ws.column_dimensions[get_column_letter(c)].width = w
 
 def generate_ei_report(source_file_path: str, output_file_path: str) -> str:
+    log.info(f"Generating EI report: {source_file_path} → {output_file_path}")
+
+    log.info("Phase 1: Loading source workbook")
     wb_src = openpyxl.load_workbook(source_file_path, data_only=True)
 
     if 'Task_per_1k' not in wb_src.sheetnames:
         raise ValueError("Sheet 'Task_per_1k' not found in source workbook")
 
+    log.info("Phase 2: Parsing Task_per_1k sheet")
     blocks = parse_task_per_1k(wb_src['Task_per_1k'])
+    log.info(f"  Found {len(blocks)} blocks ({sum(1 for b in blocks if not b['is_wtd'])} daily, {sum(1 for b in blocks if b['is_wtd'])} WTD)")
+
     daily_block = select_daily_block(blocks)
     wtd_block   = select_wtd_block(blocks)
     date_range  = build_date_range(blocks)
+    log.info(f"  Daily block: {daily_block['label']}, WTD block: {wtd_block['label']}, range: {date_range}")
 
+    log.info("Phase 3: Parsing Raw sheet")
     if 'Raw' not in wb_src.sheetnames:
         headers, filt_rows, col_map, track_idx, fwd_agt_idx, rev_agt_idx, dc_idx = [], [], {}, None, None, None, None
+        log.warning("  Raw sheet not found — skipping FWD/REV tabs")
     else:
         headers, filt_rows, col_map, track_idx, fwd_agt_idx, rev_agt_idx, dc_idx = parse_raw_tab(wb_src['Raw'])
+        log.info(f"  Total rows: {len(filt_rows)}, filtered by allowed DCs")
 
+    log.info("Phase 4: Writing output workbook")
     wb_out = openpyxl.Workbook()
     wb_out.remove(wb_out.active)
 
     write_summary_sheet(wb_out, daily_block, wtd_block, date_range)
+    log.info("  Summary sheet written")
 
     if filt_rows:
         write_filtered_dc_tab(wb_out, headers, filt_rows)
         write_fwd_ei_tab(wb_out, headers, filt_rows, track_idx)
         write_rev_ei_tab(wb_out, headers, filt_rows, track_idx)
         write_agent_summary_tab(wb_out, filt_rows, track_idx, fwd_agt_idx, rev_agt_idx, dc_idx)
+        log.info("  FWD EI, REVERSE EI, Filtered, Agent Summary tabs written")
 
+    log.info("Phase 5: Saving output file")
     wb_out.save(output_file_path)
+    log.info(f"Report saved: {output_file_path}")
     return output_file_path

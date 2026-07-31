@@ -1,16 +1,32 @@
+import time
+import logging
 from pathlib import Path
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Header, Query, Depends, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, FileResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 from ui import get_test_bench_html
 from config import CACHE_DIR
 from auth import verify_api_key
 from jobs import active_jobs, create_report_job, create_upload_report_job, _load_job
 
+log = logging.getLogger("ei_server.app")
+
+
+class RequestLoggingMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        start = time.time()
+        response = await call_next(request)
+        elapsed_ms = (time.time() - start) * 1000
+        log.info(f"{request.method} {request.url.path} → {response.status_code} ({elapsed_ms:.0f}ms)")
+        return response
+
+
 def create_app() -> FastAPI:
     app = FastAPI(title="Async EI Report Server")
 
+    app.add_middleware(RequestLoggingMiddleware)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -25,6 +41,7 @@ def create_app() -> FastAPI:
 
     @app.get("/health")
     async def health():
+        log.debug("Health check")
         return {"status": "ok", "cache_dir": str(CACHE_DIR), "active_jobs": len(active_jobs)}
 
     @app.get("/test", response_class=HTMLResponse)
