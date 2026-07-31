@@ -68,8 +68,9 @@ def background_report_job(job_id: str, file_id: str, output_path: Path) -> None:
         _save_job(job_id, job)
 
         tmp_xlsx = CACHE_DIR / f"{file_id}.xlsx"
-        if not tmp_xlsx.exists() or (time.time() - tmp_xlsx.stat().st_mtime > CACHE_TTL):
-            download_drive_file(file_id, tmp_xlsx)
+        if not file_id.startswith("upload_"):
+            if not tmp_xlsx.exists() or (time.time() - tmp_xlsx.stat().st_mtime > CACHE_TTL):
+                download_drive_file(file_id, tmp_xlsx)
 
         job["progress"] = "Generating EI Report..."
         _save_job(job_id, job)
