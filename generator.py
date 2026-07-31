@@ -309,8 +309,8 @@ def parse_raw_tab(ws):
     all_data_rows   = []
     filt_data_rows  = []
 
-    for r in range(2, max_row + 1):
-        row = [ws.cell(r, c).value for c in range(1, max_col + 1)]
+    for row_tuple in ws.iter_rows(min_row=2, max_row=max_row, min_col=1, max_col=max_col, values_only=True):
+        row = list(row_tuple)
         if not any(v for v in row):
             continue
         all_data_rows.append(row)
